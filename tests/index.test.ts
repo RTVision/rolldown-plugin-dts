@@ -1,5 +1,7 @@
+import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { execSync } from 'node:child_process'
 import { rolldownBuild } from '@sxzz/test-utils'
 import { describe, expect, test } from 'vitest'
 import { dts } from '../src/index.ts'
@@ -583,4 +585,91 @@ test('deterministic namespace import index', async () => {
   expect(results[0]).toContain('import * as stub_lib from "stub_lib"')
   // Should not have stub_lib0 since each file is independent
   expect(results[0]).not.toContain('stub_lib0')
+})
+
+/**
+ * Test for @types/* package internalization with module augmentation.
+ *
+ * Real-world scenario (from @rtvision/types):
+ * 1. Library imports from 'json-schema' (provided by @types/json-schema devDependency)
+ * 2. Library augments JSONSchema7 with custom properties (label, table, meta, etc.)
+ * 3. Library exports types that use JSONSchema7
+ * 4. Consumer imports the bundled types and accesses augmented properties
+ *
+ * Problem: When @types/json-schema is internalized (devDep, not peerDep), the bundled
+ * output contains:
+ * - interface TestSchema { $id?; type?; ... } - inlined from @types, NO augmented properties
+ * - declare module "test-schema" { interface TestSchema { label?; ... } } - separate block!
+ *
+ * The `declare module` augmentation only applies to the external module 'test-schema',
+ * but since the types were inlined, there's no external module. The local interface
+ * at the top level doesn't get the augmented properties.
+ *
+ * Result: Consumers get TS2339: "Property 'label' does not exist on type 'TestSchema'"
+ */
+test('@types/* internalization merges module augmentations', async () => {
+  const cwd = path.resolve(dirname, 'fixtures/at-types-internalization')
+  const distDir = path.resolve(cwd, 'dist')
+
+  // Build the library
+  const { chunks } = await rolldownBuild(
+    ['index.ts'],
+    [dts({ emitDtsOnly: true })],
+    { cwd, treeshake: true },
+  )
+
+  // Write output to dist/ so consumer can import it
+  fs.rmSync(distDir, { recursive: true, force: true })
+  fs.mkdirSync(distDir, { recursive: true })
+  for (const chunk of chunks) {
+    if (chunk.fileName.endsWith('.d.ts') && 'code' in chunk) {
+      fs.writeFileSync(path.resolve(distDir, chunk.fileName), chunk.code)
+    }
+  }
+
+  // Create a consumer file that uses the augmented property
+  const consumerCode = `
+import type { JsonSchema } from './dist/index';
+
+// This should work if augmentation is properly merged
+const schema: JsonSchema = {};
+const label: string | undefined = schema.label;
+`
+  const consumerFile = path.resolve(cwd, 'consumer.ts')
+  fs.writeFileSync(consumerFile, consumerCode)
+
+  // Run tsc to check if consumer can use augmented properties
+  let tscError: string | null = null
+  try {
+    execSync('pnpm exec tsc --noEmit --skipLibCheck consumer.ts', {
+      cwd,
+      stdio: 'pipe',
+      encoding: 'utf-8',
+    })
+    // If we get here, tsc passed - augmentation worked
+  } catch (error: any) {
+    tscError = error.stdout?.toString() || error.stderr?.toString() || ''
+  } finally {
+    // Clean up
+    if (fs.existsSync(consumerFile)) fs.rmSync(consumerFile)
+    if (fs.existsSync(distDir))
+      fs.rmSync(distDir, { recursive: true, force: true })
+  }
+
+  // This is the expected failure - TS2339 means augmentation didn't merge
+  if (tscError && tscError.includes('TS2339') && tscError.includes('label')) {
+    throw new Error(
+      `Module augmentation not merged with inlined interface.\n` +
+        `Consumer gets TS2339 when accessing augmented property 'label'.\n` +
+        `This happens because 'declare module "test-schema"' doesn't apply to the local inlined interface.\n\n` +
+        `tsc output:\n${tscError}`,
+    )
+  }
+
+  // If tscError is set but not TS2339, something else went wrong
+  if (tscError) {
+    throw new Error(`Unexpected tsc error:\n${tscError}`)
+  }
+
+  // If we get here, the test passed (augmentation works correctly)
 })
